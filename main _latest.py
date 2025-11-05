@@ -828,10 +828,16 @@ data,p1=geodata.read_tifs('./res/res',nodata=np.finfo(np.float32).min)
 factorsfolder=r"F:\resampled data from yousef"
 # geodata.shp2tif('susceptibility_level/susceptibility_level.shp','susceptibility_level/susceptibility_level.tif',factorsfolder+'\Aspect.tif',value_field='level')
 # geodata.shp2tif('susceptibility_level/susceptibility_level0.shp','susceptibility_level/susceptibility_level0.tif',factorsfolder+'\Aspect.tif')
+# geodata.shp2tif('susceptibility_level/susceptibility_level-high.shp','susceptibility_level/susceptibility_level-high.tif',factorsfolder+'\Aspect.tif')
 susceptibility_level,p2=geodata.read_tifs('./susceptibility_level')
 print(susceptibility_level.shape)
+
 model=[]
-High,Low=np.isin(susceptibility_level[0,0],4).flatten(),np.isin(susceptibility_level[1,0],1).flatten()
+print(np.unique(susceptibility_level[0,0].flatten()))
+print(np.unique(susceptibility_level[1,0].flatten()))
+
+High_new,High,Low=np.isin(susceptibility_level[0,0],1).flatten(),np.isin(susceptibility_level[1,0],4).flatten(),np.isin(susceptibility_level[2,0],1).flatten()
+# High=High|High_new
 #归一化的处理方式 tp,tf,nt,nf,score,f1,auc?
 methods={0:'CF-L2 Norm',1:'CF-WBiGan-GP',2:'CF-iForest',3:'CF-One-Class SVM',4:'CF-RandNet',5:'L2 Norm',6:'WBiGan-GP',7:'iForest',8:'One-Class SVM',9:'RandNet'}
 Score=[]
@@ -844,8 +850,11 @@ for idx in range(10):
     print(f'{methods[idx]}的最小/大值：{mn}    {mx}')
     x[x==np.min(x)]=(mn+mx)/2
     x=(x-mn)/(mx-mn)
-
-    high_pred,low_pred=x[High],x[Low]             #(107230,) (685001,)
+    len_high,len_low=len(High[High == 1]),len(Low[Low == 1])
+    print(len(High[High == 1]))
+    print(len(Low[Low == 1]))
+    high_pred,low_pred=x[High],x[Low]             #(107230,) 107606 ()(685001,)
+    high_pred_new=x[High_new]
     tp=np.sum((high_pred>0.75))
     fn=np.sum((high_pred<=0.75))
     tn=np.sum((low_pred<0.25))
@@ -855,15 +864,18 @@ for idx in range(10):
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-    labels,scores=np.concatenate([np.ones(107230), np.zeros(685001)]),np.concatenate([high_pred,low_pred])
+    labels,scores=np.concatenate([np.ones(len_high), np.zeros(len_low)]),np.concatenate([high_pred,low_pred])
     print(np.min(labels),np.max(labels),np.min(scores),np.max(scores))
     fpr, tpr, thresholds = roc_curve(labels, scores)
     roc_auc = auc(fpr, tpr)
 
+    # score1=122/(122+416)*np.sum(high_pred)/len(high_pred)+416/(122+416)*np.sum(high_pred_new)/len(high_pred_new)
     score1=np.sum(high_pred)/len(high_pred)
-    score2=np.sum(1-low_pred)/len(low_pred)
-    Score.append([methods[idx],round(score1*10,2),round(score2*10,2)])
-    print(f'accuracy:{accuracy}, precision:{precision}, recall:{recall}, f1:{f1}, roc_auc:{roc_auc}, score1:{score1*10:.2f}, score2:{score2*10:.2f},score:{(score1+score2)*5:.2f} ')
+    # 因为外部数据集site往往设置在沟道的末端，所以过大的susceptibility index不一定最好
+    score2=np.sum(high_pred_new)/len(high_pred_new)
+    score3=np.sum(1-low_pred)/len(low_pred)
+    Score.append([methods[idx],round(score1*10,2),round(score2*10,2),round(score3*10,2)])
+    print(f'accuracy:{accuracy}, precision:{precision}, recall:{recall}, f1:{f1}, roc_auc:{roc_auc}, score1:{score1*10:.2f}, score2:{score2*10:.2f},score3:{score3*10:.2f} ')
     y_high,x_low=np.linspace(0,1,100),np.linspace(0,1,100)
 
     X, Y = np.meshgrid(x_low, y_high)
