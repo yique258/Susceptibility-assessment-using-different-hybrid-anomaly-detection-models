@@ -1,5 +1,4 @@
 import numpy as np
-from geedim.utils import root_path
 from sumolib import net
 
 from CF import nondata
@@ -34,8 +33,6 @@ with rasterio.open(factorsfolder+'/Aspect.tif') as src:
     width = src.width
     height = src.height
     crs=src.crs
-
-
 
 # 此处可以更改，选取最好的cf值的图
 cf_sts_path=r"F:\Susceptibility Assessment\lowess_cf_distribution\plot_sts.csv"
@@ -116,7 +113,7 @@ color_map = {
     "Very High": (242/255, 65/255, 65/255)  # F24141
 }
 
-def construct_map(map_array: np.array, transform,height,width,crs,tif_path):
+def construct_map(map_array: np.array, transform,height,width,crs,tif_path,base_tif_path=factorsfolder + '/Aspect.tif'):
     """
     传入np.array，先绘制分布图，再根据transform保存为tif栅格
     :param map_array: 2D或3D numpy数组
@@ -124,12 +121,12 @@ def construct_map(map_array: np.array, transform,height,width,crs,tif_path):
     :param tif_path: 输出tif路径
     """
     import matplotlib.colors as mcolors
-
+    nodata_val=-1
     # 创建线性渐变的颜色映射
     cmap = mcolors.LinearSegmentedColormap.from_list('cmap', list(zip([0,0.01,0.33,0.66,1],list(color_map.values()))), N=256)
 
     # mask
-    map_array[map_array==map_array[0][0]]=0
+    # map_array[map_array==map_array[0][0]]=0
 
     plt.figure()
     plt.axis('off')
@@ -150,6 +147,20 @@ def construct_map(map_array: np.array, transform,height,width,crs,tif_path):
     if height!=arr.shape[-2] and width!=arr.shape[-1]:
         raise ValueError(f"尺寸不不匹配:{height,arr.shape[-2]},{width,arr.shape[-1]}")
 
+    with rasterio.open(base_tif_path) as src:
+        base_nodata = src.nodata
+        if base_nodata is None:
+            # 如果没有 nodata 值，则假设所有像素都有效
+            base_mask = np.ones(arr.shape[-2:], dtype=bool)
+        else:
+            # 读取基图第一波段作为掩码参考
+            base_band = src.read(1)
+            base_mask = (base_band != base_nodata)  # True 表示有效像素
+    if arr.ndim == 2:
+        arr[~base_mask] = nodata_val
+    else:  # 3D，假设波段数在第一位
+        for i in range(arr.shape[0]):
+            arr[i][~base_mask] = nodata_val
     with rasterio.open(
         tif_path,
         'w',
@@ -159,7 +170,7 @@ def construct_map(map_array: np.array, transform,height,width,crs,tif_path):
         count=count,
         dtype=arr.dtype,
         transform=transform,
-        nodata=0,
+        nodata=nodata_val,
         crs=crs
     ) as dst:
         if count == 1:
@@ -173,7 +184,9 @@ from sklearn.svm import OneClassSVM
 
 
 
-from sklearn.ensemble import IsolationForest
+from sklearn.ensemble import IsolationForest, RandomForestRegressor
+
+
 def isolation_forest(train_arr,evaluate_arr,type:str):
     iso_forest = IsolationForest(contamination=0.1, random_state=42)  # contamination参数类似nu
     iso_forest.fit(train_arr)
@@ -202,9 +215,14 @@ def oneclass_svm(train_arr,evaluate_arr,type:str):
         evaluate_arr=(evaluate_arr-np.min(evaluate_arr))/(np.max(evaluate_arr)-np.min(evaluate_arr))
     oneclass_svm=svm.OneClassSVM(kernel='rbf', gamma='scale', nu=0.1)
     oneclass_svm.fit(train_arr)
+    truth=np.array([1]*len(train_arr))
+    prediction = oneclass_svm.predict(train_arr)
+    score=oneclass_svm.decision_function(train_arr)+0.5
+    metrics = calculate_classification_metrics(truth, prediction, score,average='binary')
+    print_classification_report(metrics)
     res=np.array(oneclass_svm.decision_function(evaluate_arr))
     print(res.shape)
-    res=(res-min(res))/(max(res)-min(res))         #0-4
+    res=4*(res-min(res))/(max(res)-min(res))         #0-4
     print(res.shape)
     print(res)
     res_sts(res, type + '-oneclass_svm')
@@ -229,7 +247,48 @@ def L2_Norm(train_arr,evaluate_arr,type:str):
     construct_map(res, transform=transform, crs=crs, height=height, width=width,
                   tif_path=res_folder + '/' + type + '-L2_Norm.tif')
 
+from sklearn.ensemble import RandomForestClassifier
+def random_forest(train_arr, train_label, evaluate_arr, type: str):
+    """
+    随机森林二分类
 
+    参数：
+    - train_arr: 训练特征矩阵 (n_samples, 17)
+    - train_label: 训练标签 (n_samples,) , 取值 0 或 1
+    - evaluate_arr: 评估特征矩阵 (m_samples, 17)
+    - type: 'RAW' 时进行 [0,1] 归一化，否则不处
+    """
+    # 1. 归一化（使用训练集的min/max，避免数据泄漏）
+    if type == 'RAW':
+        train_arr = (train_arr - np.min(train_arr)) / (np.max(train_arr) - np.min(train_arr))
+        evaluate_arr = (evaluate_arr - np.min(evaluate_arr)) / (np.max(evaluate_arr) - np.min(evaluate_arr))
+
+    rf = RandomForestClassifier(n_estimators=100, random_state=42)
+    rf.fit(train_arr, train_label)
+    truth = train_label
+    prediction = rf.predict(train_arr)
+    print(np.unique(prediction, return_counts=True))
+    print(np.unique(truth, return_counts=True))
+    score = rf.predict_proba(train_arr)[:, 1]
+    metrics = calculate_classification_metrics(truth, prediction, score, average='binary')
+    print_classification_report(metrics)
+
+    # 4. 对评估集进行预测，得到决策分数并缩放到 1~4
+    #    使用预测概率（正类概率）作为原始分数，再线性映射到 [1,4]
+    res = rf.predict_proba(evaluate_arr)[:, 1]  # shape (m_samples,)
+    print("原始分数 shape:", res.shape)
+    # 线性缩放：min->0, max->4
+    res = 4 * (res - np.min(res)) / (np.max(res) - np.min(res))
+    print("缩放后 shape:", res.shape)
+    print("缩放结果示例:", res[:10])
+
+    # 5. 调用自定义结果统计与地图构建函数（用法与 oneclass_svm 相同）
+    res_sts(res, type + '-random_forest')
+    # 将一维结果 reshape 为二维（必须保证 len(res) == height*width）
+    res = np.array(res).reshape(height, width)
+    construct_map(res, transform=transform, crs=crs,
+                  height=height, width=width,
+                  tif_path=res_folder + '/' + type + 'res-zrandomforest.tif')
 
 
 import torch
@@ -401,23 +460,23 @@ class BiGAN(nn.Module):
                 batch_size = x.size(0)
                 valid = torch.ones(batch_size, 1).to(self.device)
                 fake = torch.zeros(batch_size, 1).to(self.device)
-                # valid_loss = self.adversarial_loss(self.discriminate(x, Ex.detach()), valid)
-                # fake_loss = self.adversarial_loss(self.discriminate(Gz.detach(), z), fake)
-                # d_loss=valid_loss+fake_loss+gradient_penalty*lambda_gp
+                valid_loss = self.adversarial_loss(self.discriminate(x, Ex.detach()), valid)
+                fake_loss = self.adversarial_loss(self.discriminate(Gz.detach(), z), fake)
+                d_loss=valid_loss+fake_loss+gradient_penalty*lambda_gp
                 # 使用 Wasserstein 损失与梯度惩罚 (WGAN-GP)
-                diff = self.discriminate(Gz.detach(), z) - self.discriminate(x, Ex.detach())
-                d_loss = torch.mean(diff) + lambda_gp * gradient_penalty
+                # diff = self.discriminate(Gz.detach(), z) - self.discriminate(x, Ex.detach())
+                # d_loss = torch.mean(diff) + lambda_gp * gradient_penalty
                 d_loss.backward()
                 self.optimizer_D.step()
 
             #  训练生成器和编码器
                 self.optimizer_G.zero_grad()
                 self.optimizer_E.zero_grad()
-                # g_loss = torch.mean(self.adversarial_loss(self.discriminate(Gz, z), valid))
-                # e_loss = torch.mean(self.adversarial_loss(self.discriminate(x, Ex), valid))
+                g_loss = torch.mean(self.adversarial_loss(self.discriminate(Gz, z), valid))
+                e_loss = torch.mean(self.adversarial_loss(self.discriminate(x, Ex), valid))
                 # WGAN-GP
-                g_loss = torch.mean(-1 * (self.discriminate(Gz, z)))
-                e_loss = torch.mean(-1 * (self.discriminate(x, Ex)))
+                # g_loss = torch.mean(-1 * (self.discriminate(Gz, z)))
+                # e_loss = torch.mean(-1 * (self.discriminate(x, Ex)))
 
                 ge_loss = (g_loss + e_loss) / 2
                 ge_loss.backward()
@@ -516,56 +575,47 @@ class Autoencoder(nn.Module):
     def __init__(self, input_dim, encoding_dim):
         super(Autoencoder, self).__init__()
         self.encoder = nn.Sequential(
+            # 引入dropout，随机0.2的神经元输出清零，模拟随机连接
             nn.Linear(input_dim, 128),
             nn.Tanh(),
+            nn.Dropout(0.2),
             nn.Linear(128, 64),
             nn.ReLU(),
+            nn.Dropout(0.2),
             nn.Linear(64, encoding_dim),
             nn.ReLU(),
+            nn.Dropout(0.2)
         )
         self.decoder = nn.Sequential(
             nn.Linear(encoding_dim, 64),
             nn.ReLU(),
+            nn.Dropout(0.2),
             nn.Linear(64, 128),
             nn.ReLU(),
+            nn.Dropout(0.2),
             nn.Linear(128, input_dim),
             nn.Tanh()
         )
     def forward(self, x):
         return self.decoder(self.encoder(x))
-import random
+
 class RandNetEnsemble(nn.Module):
-    def __init__(self, n_estimators, input_dim, encoding_dim,ratios,Type):
+    def __init__(self, n_estimators, input_dim, encoding_dim,Type):
         super(RandNetEnsemble, self).__init__()
         self.Type=Type
         self.n_estimators = n_estimators
         self.autoencoders = nn.ModuleList()
-        self.ratios=ratios
-        # for _ in range(np.sum(n_estimators)):
-        #     self.autoencoders.append(Autoencoder(input_dim, encoding_dim)).to(device)
-        total_ratio = sum(ratios)
-        layer_dims = [int(n_estimators * ratio / total_ratio) for ratio in ratios]
-        for count in layer_dims:
-            layer = nn.ModuleList([Autoencoder(input_dim, encoding_dim) for _ in range(count)])
-            self.autoencoders.append(layer)
-        self.autoencoders.to(device)
-    #     论文中说了autoencoder之间是随机连接，但是却忽略的怎么个链接法
+        for _ in range(n_estimators):
+            self.autoencoders.append(Autoencoder(input_dim, encoding_dim)).to(device)
+
     def forward(self, x):
         all_reconstructions = []
-        l,r=0,1
-        for l in range(len(self.autoencoders) - 1):
-            top_layer = self.autoencoders[l]
-            bottom_layer = self.autoencoders[l + 1]
-            for ae in top_layer:
-                ae_x = ae(x)
-                normalized_ae_x = (ae_x - ae_x.mean()) / ae_x.std()
-                all_reconstructions.append(normalized_ae_x)
-                for bot_ae in bottom_layer:
-                    if random.choice([0, 1]) == 1:  # 随机连接
-                        bot_x = bot_ae(ae_x)  # 使用top层的输出作为bottom层的输入
-                        normalized_bot_x = (bot_x - bot_x.mean()) / bot_x.std()
-                        all_reconstructions.append(normalized_bot_x)
-
+        for ae in self.autoencoders:
+            # 此处标准化一下所有的ae(x)
+            # print(f'x:{x.shape}')
+            # print(f'ae(x): {ae(x).shape}')
+            x=ae(x)
+            all_reconstructions.append((x-x.mean())/x.std())
         # 选择中位数作为输出
         all_reconstructions=torch.stack(all_reconstructions, dim=0)
         # print(f'torch.median(all_reconstructions, dim=0):{torch.median(all_reconstructions, dim=0)[0].shape}')
@@ -587,6 +637,8 @@ class RandNetEnsemble(nn.Module):
         criterion = nn.MSELoss()
         # if self.Type == 'RAW':
         #     train_data=np.tanh(train_data)
+        if self.Type == 'CF':
+            train_data=train_data*10000
         if not isinstance(train_data, torch.Tensor):
             train_data = torch.tensor(train_data, dtype=torch.float32)
         train_data = train_data.to(device)
@@ -594,18 +646,16 @@ class RandNetEnsemble(nn.Module):
         train_sts=[]
         for epoch in range(num_epochs_per_ae):
             total_loss = 0
-            for layer in self.autoencoders:
-                for ae_idx, (autoencoder, optimizer) in enumerate(zip(layer, optimizer_list)):
-                    autoencoder.train()
-                    for batch_idx, data in enumerate(train_loader):
-                        data = data.view(data.size(0), -1)  # 展平数据
-                        optimizer.zero_grad()
-                        output = autoencoder(data)
-                        loss = criterion(output, data)
-                        loss=torch.sum(loss, dim=1)    #修改
-                        loss.backward()
-                        optimizer.step()
-                        total_loss += loss.item()
+            for ae_idx, (autoencoder, optimizer) in enumerate(zip(self.autoencoders, optimizer_list)):
+                autoencoder.train()
+                for batch_idx, data in enumerate(train_loader):
+                    data = data.view(data.size(0), -1)  # 展平数据
+                    optimizer.zero_grad()
+                    output = autoencoder(data)
+                    loss = criterion(output, data)
+                    loss.backward()
+                    optimizer.step()
+                    total_loss += loss.item()
             print(f'epoch {epoch+1}, mean loss: {total_loss/self.n_estimators}')
             train_sts.append(total_loss/self.n_estimators)
             if (epoch + 1) % 10 == 0:
@@ -624,6 +674,8 @@ class RandNetEnsemble(nn.Module):
         self.eval()
         # if self.Type == 'RAW':
         #     test_data = np.tanh(test_data)
+        if self.Type == 'CF':
+           test_data=test_data*10000
         all_scores = []
 
         test_data = torch.tensor(test_data, dtype=torch.float32).to(device)
@@ -637,8 +689,6 @@ class RandNetEnsemble(nn.Module):
                 batch_scores = self.get_ensemble_reconstruction_error(batch)
                 all_scores.append(batch_scores.cpu().numpy())
         all_scores = np.concatenate(all_scores, axis=0)
-        all_scores=1-((all_scores-np.min(all_scores))/(np.max(all_scores)-np.min(all_scores)))                # error越高则susceptibility
-        # all_scores = ((all_scores - np.min(all_scores)) / (np.max(all_scores) - np.min(all_scores)))
         print(f"Score shape: {all_scores.shape}")
         res_sts(all_scores, self.Type + '-RandNet')
         all_scores = all_scores.reshape(4909, 8050)
@@ -733,8 +783,21 @@ def res_sts(map_arr: np.array, model: str):
 
 
 
+
+# 获取有效面积
+# geodata.tif2shp(factorsfolder+'/Aspect.tif','valid_area/valid_area.shp')
+# gdf=gpd.read_file(debris_area)
+# exit()
+
+
+
 # cf_factors()
+
 factors_cf=np.load('factors_cf.npy')
+suscepbility_level_2classtrain=np.load(r'F:\Susceptibility Assessment\susceptibility_level\susceptibility_level_2classtrain.npy').reshape(4909, 8050, 1)
+print(np.unique(suscepbility_level_2classtrain, return_counts=True))
+print(suscepbility_level_2classtrain.shape)
+Dataloader_low=Dataloader(factors,suscepbility_level_2classtrain,factors_cf,data_vals=[1])
 print(f'factors.shape:{factors.shape}')
 print(f'suscepbility_level.shape:{suscepbility_level.shape}')
 print(f'factors_cf.shape:{factors_cf.shape}')
@@ -743,6 +806,11 @@ raw_factors=factors.reshape(17,-1).T
 # raw_factors[raw_factors==nodata]=0
 cf_x_train_similarity=Dataloader.load_cf()
 raw_x_train_similarity=Dataloader.load_raw()
+cf_x_train_similarity_low=Dataloader_low.load_cf()
+raw_x_train_similarity_low=Dataloader_low.load_raw()
+
+print(cf_x_train_similarity.shape,raw_x_train_similarity.shape,cf_x_train_similarity_low.shape,raw_x_train_similarity_low.shape)
+
 
 
 # (107230, 17) (39517450, 17)
@@ -754,19 +822,15 @@ raw_x_train_similarity=Dataloader.load_raw()
 # print('raw-L2_Norm')
 # L2_Norm(raw_x_train_similarity,raw_factors,type='RAW')
 
-# print('raw-oneclass_svm')
-# oneclass_svm(raw_x_train_similarity,raw_factors,type='RAW')
-# print('cf-oneclass_svm')
-# oneclass_svm(cf_x_train_similarity,factors_cf,type='CF')
-# exit()
-
-
 # print('cf-isolation_forest')
 # isolation_forest(cf_x_train_similarity,factors_cf,type='CF')
 # print('raw-isolation_forest')
 # isolation_forest(raw_x_train_similarity,raw_factors,type='RAW')
 
-
+# print('cf-oneclass_svm')
+# oneclass_svm(cf_x_train_similarity,factors_cf,type='CF')
+# print('raw-oneclass_svm')
+# oneclass_svm(raw_x_train_similarity,raw_factors,type='RAW')
 
 # GAN模型测试
 def test(number:str,type:str):
@@ -798,23 +862,40 @@ def test(number:str,type:str):
 #     break
 
 # Randnet模型测试
-def test2(epoch,n,ratios,type:str):
-    Randnet=RandNetEnsemble(n_estimators=n, input_dim=17,encoding_dim=32,ratios=ratios,Type=type)
+def test2(epoch,n,type:str):
+    Randnet=RandNetEnsemble(n_estimators=n, input_dim=17,encoding_dim=32,Type=type)
     path = './res/models/' + type + '-RandNetEnsemble_' + str(epoch) + '_' + str(n) + '.pth'
     Randnet.load_model(path=path)
     Randnet.evaluate_ensemble(factors_cf)
     exit()
-# test2(30,21,[5,4,3,4,5],'CF')
+# test2(10,30,'CF')
 
 # print('cf-RandNet')
-# Randnet=RandNetEnsemble(n_estimators=21, input_dim=17,encoding_dim=32,ratios=[5,4,3,4,5],Type='CF')
-# Randnet.train_ensemble(cf_x_train_similarity,300,0.001,batch_size=64)
+# Randnet=RandNetEnsemble(n_estimators=30, input_dim=17,encoding_dim=32,Type='CF')
+# Randnet.train_ensemble(cf_x_train_similarity,100,0.001,batch_size=64)
 # Randnet.evaluate_ensemble(factors_cf)
-# print('raw-RandNet')
-# Randnet=RandNetEnsemble(n_estimators=21, input_dim=17,encoding_dim=32,ratios=[5,4,3,4,5],Type='RAW')
-# Randnet.train_ensemble(raw_x_train_similarity,300,0.001,batch_size=64)
-# Randnet.evaluate_ensemble(raw_factors)
 # exit()
+# print('raw-RandNet')
+# Randnet=RandNetEnsemble(n_estimators=20, input_dim=17,encoding_dim=32,Type='RAW')
+# Randnet.train_ensemble(raw_x_train_similarity,100,0.001,batch_size=64)
+# Randnet.evaluate_ensemble(raw_factors)
+
+# #RF
+from sklearn.utils import resample
+# print('cf-RF')
+# data_1,data_0=cf_x_train_similarity,cf_x_train_similarity_low
+# print('data1,data_0')
+# data_0 = resample(data_0,replace=False, n_samples=len(data_1),  random_state=42)  #balance 1:1
+# X_train = np.vstack([data_1, data_0])  # 总样本数 792231
+# y_train = np.hstack([np.ones(len(data_1)), np.zeros(len(data_0))])
+# random_forest(X_train, y_train, factors_cf, type='CF')
+#
+# print('raw-RF')
+# data_1,data_0=raw_x_train_similarity,raw_x_train_similarity_low
+# data_0 = resample(data_0,replace=False, n_samples=len(data_1),  random_state=42)
+# X_train = np.vstack([data_1, data_0])
+# y_train = np.hstack([np.ones(len(data_1)), np.zeros(len(data_0))])
+# random_forest(X_train, y_train, raw_factors, type='RAW')
 
 
 
@@ -831,7 +912,15 @@ factorsfolder=r"F:\resampled data from yousef"
 # geodata.shp2tif('susceptibility_level/susceptibility_level-high.shp','susceptibility_level/susceptibility_level-high.tif',factorsfolder+'\Aspect.tif')
 susceptibility_level,p2=geodata.read_tifs('./susceptibility_level')
 print(susceptibility_level.shape)
-
+with rasterio.open(factorsfolder + '/Aspect.tif') as src:
+    base_nodata = src.nodata
+    if base_nodata is None:
+        # 如果没有 nodata 值，则假设所有像素都有效
+        base_mask = np.ones((4909,8050), dtype=bool)
+    else:
+        # 读取基图第一波段作为掩码参考
+        base_band = src.read(1)
+        base_mask = (base_band != base_nodata)
 model=[]
 print(np.unique(susceptibility_level[0,0].flatten()))
 print(np.unique(susceptibility_level[1,0].flatten()))
@@ -839,17 +928,34 @@ print(np.unique(susceptibility_level[1,0].flatten()))
 High_new,High,Low=np.isin(susceptibility_level[0,0],1).flatten(),np.isin(susceptibility_level[1,0],4).flatten(),np.isin(susceptibility_level[2,0],1).flatten()
 # High=High|High_new
 #归一化的处理方式 tp,tf,nt,nf,score,f1,auc?
-methods={0:'CF-L2 Norm',1:'CF-WBiGan-GP',2:'CF-iForest',3:'CF-One-Class SVM',4:'CF-RandNet',5:'L2 Norm',6:'WBiGan-GP',7:'iForest',8:'One-Class SVM',9:'RandNet'}
+# methods={0:'CF-L2 Norm',1:'CF-WBiGan-GP',2:'CF-iForest',3:'CF-One-Class SVM',4:'CF-RandNet',5:'L2 Norm',6:'WBiGan-GP',7:'iForest',8:'One-Class SVM',9:'RandNet'}
+methods={0:'CF-L2_Norm',1:'CF-WBiGan-GP',2:'CF-IsoForest',3:'CF-One-class SVM',4:'CF-RandNet',5:'CF-Randomforest',6:'L2_Norm',7:'WBiGan-GP',8:'IsoForest',9:'One-class SVM',10:'RandNet',11:'Randomforest'}
+
+method_to_letter = {
+    'L2 Norm': '(a)',
+    'CF-L2 Norm': '(b)',
+    'One-Class SVM': '(c)',
+    'CF-One-Class SVM': '(d)',
+    'iForest': '(e)',
+    'CF-iForest': '(f)',
+    'RandNet': '(g)',
+    'CF-RandNet': '(h)',
+    'WBiGan-GP': '(i)',
+    'CF-WBiGan-GP': '(j)',
+    'Randomforest': '(k)',
+    'CF-Randomforest': '(l)'
+
+}
 Score=[]
 save_fig_folder= r'F:\Susceptibility Assessment\res\res_sts/'
-for idx in range(10):
-    x=np.array(data[idx][0]).flatten()
 
+for idx in range(12):
+    x = data[idx][0].flatten()
+    x[x < 0] = 0
     # mn,mx=np.min(x),np.max(x)
-    mn,mx=np.unique(x)[1],np.max(x)
+    mn, mx = np.min(x), np.max(x)
+    x = (x - mn) / (mx - mn)
     print(f'{methods[idx]}的最小/大值：{mn}    {mx}')
-    x[x==np.min(x)]=(mn+mx)/2
-    x=(x-mn)/(mx-mn)
     len_high,len_low=len(High[High == 1]),len(Low[Low == 1])
     print(len(High[High == 1]))
     print(len(Low[Low == 1]))
@@ -871,11 +977,19 @@ for idx in range(10):
 
     # score1=122/(122+416)*np.sum(high_pred)/len(high_pred)+416/(122+416)*np.sum(high_pred_new)/len(high_pred_new)
     score1=np.sum(high_pred)/len(high_pred)
-    # 因为外部数据集site往往设置在沟道的末端，所以过大的susceptibility index不一定最好
     score2=np.sum(high_pred_new)/len(high_pred_new)
     score3=np.sum(1-low_pred)/len(low_pred)
     Score.append([methods[idx],round(score1*10,2),round(score2*10,2),round(score3*10,2)])
     print(f'accuracy:{accuracy}, precision:{precision}, recall:{recall}, f1:{f1}, roc_auc:{roc_auc}, score1:{score1*10:.2f}, score2:{score2*10:.2f},score3:{score3*10:.2f} ')
+    bins = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+    counts, edges = np.histogram(x, bins=bins)
+    print("===== 0~1 区间统计 =====")
+    labels = ["0.0~0.2", "0.2~0.4", "0.4~0.6", "0.6~0.8", "0.8~1.0"]
+    total = len(x)
+    for i, (label, cnt) in enumerate(zip(labels, counts)):
+        pct = cnt / total * 100
+        print(f"{label} : {cnt:>5} 个  ({pct:.2f}%)")
+
     y_high,x_low=np.linspace(0,1,100),np.linspace(0,1,100)
 
     X, Y = np.meshgrid(x_low, y_high)
@@ -909,61 +1023,78 @@ for idx in range(10):
             recall_matrix[i, j] = recall
             f1_matrix[i, j] = f1
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 12),constrained_layout=True)
-    # fig.suptitle(str(methods[idx]), fontsize=25, fontweight='bold')
+    plt.rcParams['font.size'] = 10  # 设置字体大小
+    plt.rcParams['font.family'] = 'Times New Roman'
+    plt.rcParams['mathtext.fontset'] = 'stix'
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+
+
     # cmap = plt.cm.viridis
     cmap = plt.cm.turbo
     norm = plt.Normalize(vmin=0, vmax=1)
-    plt.rcParams['font.size'] = 14  # 设置字体大小
-    plt.rcParams['font.weight'] = 'bold'  # 设置字体加粗
 
-    contour1 = axes[0, 0].contourf(X, Y, accuracy_matrix, 20, cmap=cmap, norm=norm, alpha=0.8)
+
+    levels=10
+    contour1 = axes[0, 0].contourf(X, Y, accuracy_matrix, levels, cmap=cmap, norm=norm, alpha=0.8)
     axes[0, 0].set_title('Accuracy', fontsize=20, fontweight='bold')
     axes[0, 0].set_xlabel('low susceptible threshold', fontsize=16, fontweight='bold')
     axes[0, 0].set_ylabel('high susceptible threshold', fontsize=16, fontweight='bold')
     axes[0, 0].plot([x_low.min(), x_low.max()], [y_high.min(), y_high.max()], '--', color='black',alpha=0.7, label='y=x')
     axes[0, 0].legend()
 
-    contour2 = axes[0, 1].contourf(X, Y, precision_matrix, 20, cmap=cmap, norm=norm, alpha=0.8)
+    contour2 = axes[0, 1].contourf(X, Y, precision_matrix, levels, cmap=cmap, norm=norm, alpha=0.8)
     axes[0, 1].set_title('Precision', fontsize=20, fontweight='bold')
     axes[0, 1].set_xlabel('low susceptible threshold', fontsize=16, fontweight='bold')
     axes[0, 1].set_ylabel('high susceptible threshold', fontsize=16, fontweight='bold')
     axes[0, 1].plot([x_low.min(), x_low.max()], [y_high.min(), y_high.max()], '--', color='black',alpha=0.7, label='y=x')
     axes[0, 1].legend()
 
-    contour3 = axes[1, 0].contourf(X, Y, recall_matrix, 20, cmap=cmap, norm=norm, alpha=0.8)
+    contour3 = axes[1, 0].contourf(X, Y, recall_matrix, levels, cmap=cmap, norm=norm, alpha=0.8)
     axes[1, 0].set_title('Recall', fontsize=20, fontweight='bold')
     axes[1, 0].set_xlabel('low susceptible threshold', fontsize=16, fontweight='bold')
     axes[1, 0].set_ylabel('high susceptible threshold', fontsize=16, fontweight='bold')
     axes[1, 0].plot([x_low.min(), x_low.max()], [y_high.min(), y_high.max()], '--', color='black',alpha=0.7, label='y=x')
     axes[1, 0].legend()
 
-    contour4 = axes[1, 1].contourf(X, Y, f1_matrix, 20, cmap=cmap, norm=norm, alpha=0.8)
+    contour4 = axes[1, 1].contourf(X, Y, f1_matrix, levels, cmap=cmap, norm=norm, alpha=0.8)
     axes[1, 1].set_title('F1 Score', fontsize=20, fontweight='bold')
     axes[1, 1].set_xlabel('low susceptible threshold', fontsize=16, fontweight='bold')
     axes[1, 1].set_ylabel('high susceptible threshold', fontsize=16, fontweight='bold')
     axes[1, 1].plot([x_low.min(), x_low.max()], [y_high.min(), y_high.max()], '--', color='black',alpha=0.7, label='y=x')
     axes[1, 1].legend()
 
-    plt.tight_layout(rect=[0, 0, 0.9, 0.95])
-    cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])  # [left, bottom, width, height]
-    cbar = fig.colorbar(contour1, cax=cbar_ax)
-    cbar.set_label('Metric Value', rotation=270, labelpad=15,fontweight='bold')
-    path=save_fig_folder+methods[idx]+'.png'
-    plt.savefig(path, dpi=300,format='png')
+    plt.tight_layout(rect=[0, 0, 1, 0.95])  # 调整上边距为标题留空间
+    letter = method_to_letter.get(methods[idx], '')
+    fig.suptitle(methods[idx], fontsize=30, fontweight='bold')#y=0.98
+    letter = method_to_letter.get(methods[idx], '')
+    if letter:
+        fig.text(0.02, 0.98, letter, fontsize=30,
+                 va='top', ha='left')
+
+    # plt.tight_layout(rect=[0, 0, 0.9, 0.95])
+    # cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])  # [left, bottom, width, height]
+    # contour1.set_clim(0, 1)
+    # cbar = fig.colorbar(contour1, cax=cbar_ax)
+    # cbar.set_ticks([0, 0.2, 0.4, 0.6, 0.8, 1])
+    # tick_labels = cbar.ax.get_yticklabels()
+    # plt.setp(tick_labels, fontsize=16, fontweight='bold')
+
+    path=save_fig_folder+methods[idx]+'.tif'
+    plt.savefig(path, dpi=300,format='tiff')
     plt.show()
 
     # 转换为 DataFrame 并保存为 CSV
-df = pd.DataFrame(accuracy_matrix)
-df.to_csv(save_fig_folder+'accuracy_matrix.csv', index=False, encoding='utf-8-sig')
-df = pd.DataFrame(precision_matrix)
-df.to_csv(save_fig_folder+'precision_matrix.csv', index=False, encoding='utf-8-sig')
-df = pd.DataFrame(f1_matrix)
-df.to_csv(save_fig_folder+'f1_matrix.csv', index=False, encoding='utf-8-sig')
-df = pd.DataFrame(recall_matrix)
-df.to_csv(save_fig_folder+'recall_matrix.csv', index=False, encoding='utf-8-sig')
-df = pd.DataFrame(Score, columns=['Models', 'Score1', 'Score2'])
-df.to_csv(save_fig_folder+'results.csv', index=False, encoding='utf-8-sig')
+# df = pd.DataFrame(accuracy_matrix)
+# df.to_csv(save_fig_folder+'accuracy_matrix.csv', index=False, encoding='utf-8-sig')
+# df = pd.DataFrame(precision_matrix)
+# df.to_csv(save_fig_folder+'precision_matrix.csv', index=False, encoding='utf-8-sig')
+# df = pd.DataFrame(f1_matrix)
+# df.to_csv(save_fig_folder+'f1_matrix.csv', index=False, encoding='utf-8-sig')
+# df = pd.DataFrame(recall_matrix)
+# df.to_csv(save_fig_folder+'recall_matrix.csv', index=False, encoding='utf-8-sig')
+# df = pd.DataFrame(Score, columns=['Models', 'Score1', 'Score2'])
+# df.to_csv(save_fig_folder+'results.csv', index=False, encoding='utf-8-sig')
 
     # cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])  # [left, bottom, width, height]
     # cbar = fig.colorbar(contour1, cax=cbar_ax,shrink=0.8, aspect=20, pad=0.05)
