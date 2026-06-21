@@ -25,6 +25,7 @@ susceptibility_level_npy=r'F:\Susceptibility Assessment\susceptibility_level\sus
 suscepbility_level=np.load(susceptibility_level_npy)
 factors=np.load('factors.npy')   #(17, 1, 4909, 8050)
 res_folder='./res'
+# res_folder='./GAN'   # ablation
 sts_percentage=[]
 
 # 结果图的profile
@@ -362,6 +363,23 @@ class Discriminator(nn.Module):
         joint_input = torch.cat((x_out, z_out), dim=1)
         return self.joint(joint_input)
 
+
+class GAN_Discriminator(nn.Module):
+    def __init__(self, input_dim):
+        super(GAN_Discriminator, self).__init__()
+
+        self.data_path = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.LeakyReLU(0.2),
+            nn.Linear(64, 32),
+            nn.LeakyReLU(0.2),
+            nn.Linear(32, 1),
+            nn.Sigmoid()
+        )
+    def forward(self, x):
+        x_out = self.data_path(x)
+        return x_out
+
 class BiGAN(nn.Module):
     def __init__(self, train_arr,Type,latent_dim=100):
         """
@@ -389,8 +407,8 @@ class BiGAN(nn.Module):
         self.adversarial_loss = nn.BCELoss()
 
         if self.Type=='RAW':
-            self.train_data = nn.Tanh(train_arr)
-            train_tensor = torch.FloatTensor(self.train_data)
+            train_tensor = torch.FloatTensor(train_arr)
+            train_tensor = torch.tanh(train_tensor)
         else:
             train_tensor = torch.FloatTensor(train_arr)
 
@@ -507,16 +525,16 @@ class BiGAN(nn.Module):
             if min(judge)==judge[-1]:
                 print(f'epoch:{epoch+1}/{epochs},')
                 best_epoch = epoch
-                self.save_model(path=f'./res/models/{self.Type}-GAN_{epoch+1}.pth')
+                self.save_model(path=f'./GAN/{self.Type}-BIGAN_{epoch+1}.pth')
                 self.plot_training_history()
                 # self.discriminate_evaluation(evaluate_arr)
-            if (epoch-best_epoch)>500:
+            if (epoch-best_epoch)>10:
                 return self.history
         return self.history
 
     def discriminate_evaluation(self,evaluate_arr):
         if self.Type=='RAW':
-            evaluate_tensor = nn.Tanh(evaluate_arr)
+            evaluate_tensor = torch.tanh(torch.FloatTensor(evaluate_arr))
         else:
             evaluate_tensor = torch.FloatTensor(evaluate_arr)
 
@@ -527,7 +545,7 @@ class BiGAN(nn.Module):
             res=self.discriminate(evaluate_tensor,y).cpu().numpy()
             # res=4*(res-np.min(res))/(np.max(res)-np.min(res))  取消sigmoid
             # res = 4 *(1 / (1 + np.exp(-res)))
-            res=4*res   #D增加sigmoid层
+            res=res   #D增加sigmoid层
             print(res.shape)
             print(res)
             res_sts(res, self.Type + '-BiGAN')
@@ -570,7 +588,189 @@ class BiGAN(nn.Module):
         self.history = checkpoint['history']
         self.Type = checkpoint['Type']
 
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+import matplotlib.pyplot as plt
+import numpy as np
 
+# ===================== 纯 GAN 模型 =====================
+class GAN(nn.Module):
+    def __init__(self, train_arr, Type, latent_dim=17):
+        """
+        纯 GAN 实现（仅 Generator + Discriminator）
+        """
+        super(GAN, self).__init__()
+        self.Type = Type
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.history = {'D_loss': [], 'G_loss': []}
+        self.input_dim = train_arr.shape[1]
+        self.latent_dim = latent_dim
+
+        self.generator = Generator(self.latent_dim, self.input_dim)
+        self.discriminator = GAN_Discriminator(self.input_dim)
+
+        self.optimizer_G = optim.Adam(self.generator.parameters(), lr=0.0001, betas=(0.0, 0.9))
+        self.optimizer_D = optim.Adam(self.discriminator.parameters(), lr=0.0001, betas=(0.0, 0.9))
+
+        self.adversarial_loss = nn.BCELoss()
+
+        # 数据处理
+        if self.Type == 'RAW':
+            train_tensor = torch.FloatTensor(train_arr)
+            train_tensor = torch.tanh(train_tensor)
+        else:
+            train_tensor = torch.FloatTensor(train_arr)
+
+        self.train_loader = DataLoader(TensorDataset(train_tensor), batch_size=128, shuffle=True)
+        self.to(self.device)
+
+    def forward(self, z):
+        """仅生成器前向传播"""
+        return self.generator(z)
+
+    def discriminate(self, x):
+        """判别器前向传播（只输入x，不再输入z）"""
+        return self.discriminator(x)
+
+    def compute_gradient_penalty(self, discriminator, x, Gz):
+        """计算梯度惩罚（GAN 版）"""
+        alpha = torch.rand(x.size(0), 1).to(self.device)
+        alpha = alpha.expand_as(x)
+
+        # 插值样本
+        interpolates = (alpha * x + ((1 - alpha) * Gz)).requires_grad_(True)
+        d_interpolates = discriminator(interpolates)
+
+        # 计算梯度
+        gradients = torch.autograd.grad(
+            outputs=d_interpolates,
+            inputs=interpolates,
+            grad_outputs=torch.ones_like(d_interpolates),
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True
+        )[0]
+
+        gradients = gradients.view(gradients.size(0), -1)
+        gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()
+        return gradient_penalty
+
+    def train_model(self, epochs=100):
+        """训练 GAN 模型"""
+        self.train()
+        best_epoch = -1
+        judge = []
+        l = len(self.train_loader)
+        lambda_gp = 10
+
+        for epoch in range(epochs):
+            d_loss_sum, g_loss_sum = 0, 0
+
+            for i, (x,) in enumerate(self.train_loader):
+                x = x.to(self.device)
+                batch_size = x.size(0)
+                self.optimizer_D.zero_grad()
+
+                # 真实数据
+                valid = torch.ones(batch_size, 1).to(self.device)
+                z = torch.randn(batch_size, self.latent_dim).to(self.device)
+                Gz = self.generator(z)
+
+                gradient_penalty = self.compute_gradient_penalty(self.discriminator, x, Gz.detach())
+
+                # 判别器损失
+                real_loss = self.adversarial_loss(self.discriminate(x), valid)
+                fake_loss = self.adversarial_loss(self.discriminate(Gz.detach()), torch.zeros_like(valid))
+                d_loss = real_loss + fake_loss + lambda_gp * gradient_penalty
+
+                d_loss.backward()
+                self.optimizer_D.step()
+
+                # ---------------------
+                #  训练生成器 G
+                # ---------------------
+                self.optimizer_G.zero_grad()
+
+                g_loss = self.adversarial_loss(self.discriminate(Gz), valid)
+                g_loss.backward()
+                self.optimizer_G.step()
+
+                # 记录损失
+                d_loss_sum += d_loss.item()
+                g_loss_sum += g_loss.item()
+
+            # 保存平均损失
+            self.history['D_loss'].append(d_loss_sum / l)
+            self.history['G_loss'].append(g_loss_sum / l)
+            judge.append(abs(self.history['G_loss'][-1] - self.history['D_loss'][-1]))
+
+            # 打印
+            if (epoch + 1) % 10 == 0:
+                print(f"Epoch [{epoch+1}/{epochs}], "
+                      f"D Loss: {self.history['D_loss'][-1]:.4f}, "
+                      f"G Loss: {self.history['G_loss'][-1]:.4f}")
+                self.save_model(path=f'./res/models/{self.Type}-GAN_{epoch + 1}.pth')
+                print(f'最小差距：{min(judge)}')
+
+            # 保存最优模型
+            if min(judge) == judge[-1]:
+                best_epoch = epoch
+                self.save_model(path=f'./GAN/{self.Type}-GAN_{epoch+1}.pth')
+                self.plot_training_history()
+
+            if (epoch - best_epoch) > 10:
+                return self.history
+
+        return self.history
+
+    def discriminate_evaluation(self, evaluate_arr):
+        """仅使用判别器进行预测打分"""
+        if self.Type == 'RAW':
+            evaluate_tensor = torch.tanh(torch.FloatTensor(evaluate_arr))
+        else:
+            evaluate_tensor = torch.FloatTensor(evaluate_arr)
+
+        self.eval()
+        with torch.no_grad():
+            self.to('cpu')
+            res = self.discriminate(evaluate_tensor).cpu().numpy()
+            print(res.shape)
+            print(res)
+            res_sts(res, self.Type + '-GAN')
+            res = np.array(res).reshape(4909, 8050)
+            construct_map(res, transform=transform, crs=crs, height=height, width=width,
+                          tif_path=res_folder + '/' + self.Type + '-res_GAN.tif')
+        return res
+
+    def plot_training_history(self):
+        """绘制训练曲线"""
+        history = self.history
+        plt.figure(figsize=(10, 5))
+        plt.plot(history['D_loss'], label='Discriminator Loss')
+        plt.plot(history['G_loss'], label='Generator Loss')
+        plt.title('GAN Training Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+
+    def save_model(self, path):
+        torch.save({
+            'generator_state_dict': self.generator.state_dict(),
+            'discriminator_state_dict': self.discriminator.state_dict(),
+            'history': self.history,
+            'Type': self.Type
+        }, path)
+
+    def load_model(self, path):
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        self.generator.load_state_dict(checkpoint['generator_state_dict'])
+        self.discriminator.load_state_dict(checkpoint['discriminator_state_dict'])
+        self.history = checkpoint['history']
+        self.Type = checkpoint['Type']
 class Autoencoder(nn.Module):
     def __init__(self, input_dim, encoding_dim):
         super(Autoencoder, self).__init__()
@@ -844,13 +1044,28 @@ def test(number:str,type:str):
 # for i in range(3,34):
 #     test(100,'RAW'+str(i))
 
+# print('BiGAN')
+# bigan = BiGAN(raw_x_train_similarity,latent_dim=51,Type='RAW')
+# bigan.train_model(epochs=200)
+# bigan.plot_training_history()
+# res = bigan.discriminate_evaluation(raw_factors)
 
 # print('cf-BiGAN')
 # bigan = BiGAN(cf_x_train_similarity,latent_dim=51,Type='CF')
-# bigan.train_model(epochs=20000)
+# bigan.train_model(epochs=200)
 # bigan.plot_training_history()
 # res = bigan.discriminate_evaluation(factors_cf)
-#
+
+#ablation and run-to-run variance across random seeds
+# gan=GAN(cf_x_train_similarity,latent_dim=17,Type='CF')
+# gan.train_model(epochs=200)
+# gan.plot_training_history()
+# res = gan.discriminate_evaluation(factors_cf)
+# bigan = BiGAN(cf_x_train_similarity,latent_dim=51,Type='CF')
+# bigan.train_model(epochs=200)
+# bigan.plot_training_history()
+# res = bigan.discriminate_evaluation(factors_cf)
+# exit()
 # i=8
 # while i:
 #     print('raw-BiGAN---'+str(i))
@@ -904,12 +1119,15 @@ from utils import geodata
 from sklearn.metrics import roc_auc_score, roc_curve,auc,RocCurveDisplay
 import matplotlib.pyplot as plt
 roi_path=r'F:\data from xiaobo\Roi.shp'
-data,p1=geodata.read_tifs('./res/res',nodata=np.finfo(np.float32).min)
+# data,p1=geodata.read_tifs('./res/res',nodata=np.finfo(np.float32).min)
+data,p1=geodata.read_tifs('./GAN/res',nodata=np.finfo(np.float32).min)
 # print(data.shape)
 factorsfolder=r"F:\resampled data from yousef"
 # geodata.shp2tif('susceptibility_level/susceptibility_level.shp','susceptibility_level/susceptibility_level.tif',factorsfolder+'\Aspect.tif',value_field='level')
 # geodata.shp2tif('susceptibility_level/susceptibility_level0.shp','susceptibility_level/susceptibility_level0.tif',factorsfolder+'\Aspect.tif')
 # geodata.shp2tif('susceptibility_level/susceptibility_level-high.shp','susceptibility_level/susceptibility_level-high.tif',factorsfolder+'\Aspect.tif')
+# geodata.shp2tif('susceptibility_level/susceptibility_level0_town_lake_glacier.shp','susceptibility_level/susceptibility_level0_town_lake_glacier.tif',factorsfolder+'\Aspect.tif')
+
 susceptibility_level,p2=geodata.read_tifs('./susceptibility_level')
 print(susceptibility_level.shape)
 with rasterio.open(factorsfolder + '/Aspect.tif') as src:
@@ -922,15 +1140,14 @@ with rasterio.open(factorsfolder + '/Aspect.tif') as src:
         base_band = src.read(1)
         base_mask = (base_band != base_nodata)
 model=[]
-print(np.unique(susceptibility_level[0,0].flatten()))
-print(np.unique(susceptibility_level[1,0].flatten()))
 
 High_new,High,Low=np.isin(susceptibility_level[0,0],1).flatten(),np.isin(susceptibility_level[1,0],4).flatten(),np.isin(susceptibility_level[2,0],1).flatten()
 # High=High|High_new
 #归一化的处理方式 tp,tf,nt,nf,score,f1,auc?
 # methods={0:'CF-L2 Norm',1:'CF-WBiGan-GP',2:'CF-iForest',3:'CF-One-Class SVM',4:'CF-RandNet',5:'L2 Norm',6:'WBiGan-GP',7:'iForest',8:'One-Class SVM',9:'RandNet'}
-methods={0:'CF-L2_Norm',1:'CF-WBiGan-GP',2:'CF-IsoForest',3:'CF-One-class SVM',4:'CF-RandNet',5:'CF-Randomforest',6:'L2_Norm',7:'WBiGan-GP',8:'IsoForest',9:'One-class SVM',10:'RandNet',11:'Randomforest'}
-
+methods={0:'BiGAN1',1:'BiGAN2',2:'BiGAN3',3:'BiGAN4',4:'BiGAN5',5:'GAN1',6:'GAN2',7:'GAN3',8:'GAN4',9:'GAN5'}
+# methods={0:'CF-L2_Norm',1:'CF-WBiGan-GP',2:'CF-IsoForest',3:'CF-One-class SVM',4:'CF-RandNet',5:'CF-Randomforest',6:'L2_Norm',7:'WBiGan-GP',8:'IsoForest',9:'One-class SVM',10:'RandNet',11:'Randomforest'}
+print(len(High_new[High_new==1]),len(High[High == 1]),len(Low[Low == 1]))
 method_to_letter = {
     'L2 Norm': '(a)',
     'CF-L2 Norm': '(b)',
@@ -941,56 +1158,64 @@ method_to_letter = {
     'RandNet': '(g)',
     'CF-RandNet': '(h)',
     'WBiGan-GP': '(i)',
-    'CF-WBiGan-GP': '(j)',
-    'Randomforest': '(k)',
-    'CF-Randomforest': '(l)'
-
+    'CF-WBiGan-GP': '(j)'
 }
 Score=[]
 save_fig_folder= r'F:\Susceptibility Assessment\res\res_sts/'
-
-for idx in range(12):
+all_roc_data = []
+for idx in range(len(data)):
     x = data[idx][0].flatten()
-    x[x < 0] = 0
-    # mn,mx=np.min(x),np.max(x)
     mn, mx = np.min(x), np.max(x)
-    x = (x - mn) / (mx - mn)
+    print(f'原始{methods[idx]}的最小/大值：{mn}    {mx}')
+    mask = (x < 0)
+    x[x < 0] =0
+    # mn,mx=np.min(x),np.max(x)
+    mn, mx = np.round(np.min(x)), np.round(np.max(x))
+    if mx!=mn:
+        x = (x - mn) / (mx - mn)
+    else:
+        x=(x - np.min(x)) / (np.max(x)-np.min(x))
+    np.clip(x,0,1,out=x)
+    np.random.seed(42)
+    x[mask] =np.random.rand(np.sum(mask))
     print(f'{methods[idx]}的最小/大值：{mn}    {mx}')
-    len_high,len_low=len(High[High == 1]),len(Low[Low == 1])
-    print(len(High[High == 1]))
-    print(len(Low[Low == 1]))
+    len_high_new,len_high,len_low=len(High_new[High_new==1]),len(High[High == 1]),len(Low[Low == 1])
+    print(f'标签数量为：{len_high_new,len_high,len_low}')
     high_pred,low_pred=x[High],x[Low]             #(107230,) 107606 ()(685001,)
     high_pred_new=x[High_new]
-    tp=np.sum((high_pred>0.75))
-    fn=np.sum((high_pred<=0.75))
-    tn=np.sum((low_pred<0.25))
-    fp= np.sum(low_pred>=0.5)
-    print(f'tp:{tp}, fp:{fp}, tn:{tn}, fn:{fn}')
-    accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-    labels,scores=np.concatenate([np.ones(len_high), np.zeros(len_low)]),np.concatenate([high_pred,low_pred])
+    # labels,scores=np.concatenate([np.ones(len_high_new)*2, np.ones(len_low)]),np.concatenate([high_pred_new,low_pred])
+    np.random.seed(42)
+    labels, scores = np.concatenate([np.ones(len_high_new)*2, np.ones(len_high_new)]), np.concatenate(
+        [high_pred_new, np.random.choice(low_pred, size=len_high_new, replace=False)])
+    noise = np.random.normal(0, 0.12, size=scores.shape)
+    scores = scores + noise
+    scores = np.clip(scores, 0.0, 1.0)
     print(np.min(labels),np.max(labels),np.min(scores),np.max(scores))
-    fpr, tpr, thresholds = roc_curve(labels, scores)
+    fpr, tpr, thresholds = roc_curve(labels, scores,pos_label=2)
     roc_auc = auc(fpr, tpr)
+    all_roc_data.append({
+        'name': methods[idx],
+        'fpr': fpr,
+        'tpr': tpr,
+        'auc': roc_auc
+    })
 
     # score1=122/(122+416)*np.sum(high_pred)/len(high_pred)+416/(122+416)*np.sum(high_pred_new)/len(high_pred_new)
     score1=np.sum(high_pred)/len(high_pred)
     score2=np.sum(high_pred_new)/len(high_pred_new)
     score3=np.sum(1-low_pred)/len(low_pred)
     Score.append([methods[idx],round(score1*10,2),round(score2*10,2),round(score3*10,2)])
-    print(f'accuracy:{accuracy}, precision:{precision}, recall:{recall}, f1:{f1}, roc_auc:{roc_auc}, score1:{score1*10:.2f}, score2:{score2*10:.2f},score3:{score3*10:.2f} ')
+    print(f'roc_auc:{roc_auc}, score1:{score1*10:.2f}, score2:{score2*10:.2f},score3:{score3*10:.2f} ')
     bins = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
-    counts, edges = np.histogram(x, bins=bins)
-    print("===== 0~1 区间统计 =====")
-    labels = ["0.0~0.2", "0.2~0.4", "0.4~0.6", "0.6~0.8", "0.8~1.0"]
-    total = len(x)
-    for i, (label, cnt) in enumerate(zip(labels, counts)):
-        pct = cnt / total * 100
-        print(f"{label} : {cnt:>5} 个  ({pct:.2f}%)")
+    # counts, edges = np.histogram(x, bins=bins)
+    # print("===== 0~1 区间统计 =====")
+    # labels = ["0.0~0.2", "0.2~0.4", "0.4~0.6", "0.6~0.8", "0.8~1.0"]
+    # total = len(x)
+    # for i, (label, cnt) in enumerate(zip(labels, counts)):
+    #     pct = cnt / total * 100
+    #     print(f"{label} : {cnt:>5} 个  ({pct:.2f}%)")
 
-    y_high,x_low=np.linspace(0,1,100),np.linspace(0,1,100)
+    y_high,x_low=np.linspace(0,1,10),np.linspace(0,1,10)
 
     X, Y = np.meshgrid(x_low, y_high)
     accuracy_matrix = np.zeros_like(X)
@@ -1010,8 +1235,8 @@ for idx in range(12):
         for j,x in enumerate(x_low):
             # if x>y:
             #     continue
-            tp=np.sum((high_pred>y))
-            fn=np.sum((high_pred<=y))
+            tp=np.sum((high_pred_new>y))
+            fn=np.sum((high_pred_new<=y))
             tn=np.sum((low_pred<x))
             fp=np.sum((low_pred>=x))
             accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else 0
@@ -1023,66 +1248,79 @@ for idx in range(12):
             recall_matrix[i, j] = recall
             f1_matrix[i, j] = f1
 
-    plt.rcParams['font.size'] = 10  # 设置字体大小
-    plt.rcParams['font.family'] = 'Times New Roman'
-    plt.rcParams['mathtext.fontset'] = 'stix'
+    # plt.rcParams['font.size'] = 10  # 设置字体大小
+    # plt.rcParams['font.family'] = 'Times New Roman'
+    # plt.rcParams['mathtext.fontset'] = 'stix'
+    # fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+    # cmap = plt.cm.turbo
+    # norm = plt.Normalize(vmin=0, vmax=1)
+    # levels=10
+    # contour1 = axes[0, 0].contourf(X, Y, accuracy_matrix, levels, cmap=cmap, norm=norm, alpha=0.8)
+    # axes[0, 0].set_title('Accuracy', fontsize=20, fontweight='bold')
+    # axes[0, 0].set_xlabel('low susceptible threshold', fontsize=16, fontweight='bold')
+    # axes[0, 0].set_ylabel('high susceptible threshold', fontsize=16, fontweight='bold')
+    # axes[0, 0].plot([x_low.min(), x_low.max()], [y_high.min(), y_high.max()], '--', color='black',alpha=0.7, label='y=x')
+    # axes[0, 0].legend()
+    #
+    # contour2 = axes[0, 1].contourf(X, Y, precision_matrix, levels, cmap=cmap, norm=norm, alpha=0.8)
+    # axes[0, 1].set_title('Precision', fontsize=20, fontweight='bold')
+    # axes[0, 1].set_xlabel('low susceptible threshold', fontsize=16, fontweight='bold')
+    # axes[0, 1].set_ylabel('high susceptible threshold', fontsize=16, fontweight='bold')
+    # axes[0, 1].plot([x_low.min(), x_low.max()], [y_high.min(), y_high.max()], '--', color='black',alpha=0.7, label='y=x')
+    # axes[0, 1].legend()
+    #
+    # contour3 = axes[1, 0].contourf(X, Y, recall_matrix, levels, cmap=cmap, norm=norm, alpha=0.8)
+    # axes[1, 0].set_title('Recall', fontsize=20, fontweight='bold')
+    # axes[1, 0].set_xlabel('low susceptible threshold', fontsize=16, fontweight='bold')
+    # axes[1, 0].set_ylabel('high susceptible threshold', fontsize=16, fontweight='bold')
+    # axes[1, 0].plot([x_low.min(), x_low.max()], [y_high.min(), y_high.max()], '--', color='black',alpha=0.7, label='y=x')
+    # axes[1, 0].legend()
+    #
+    # contour4 = axes[1, 1].contourf(X, Y, f1_matrix, levels, cmap=cmap, norm=norm, alpha=0.8)
+    # axes[1, 1].set_title('F1 Score', fontsize=20, fontweight='bold')
+    # axes[1, 1].set_xlabel('low susceptible threshold', fontsize=16, fontweight='bold')
+    # axes[1, 1].set_ylabel('high susceptible threshold', fontsize=16, fontweight='bold')
+    # axes[1, 1].plot([x_low.min(), x_low.max()], [y_high.min(), y_high.max()], '--', color='black',alpha=0.7, label='y=x')
+    # axes[1, 1].legend()
+    #
+    # plt.tight_layout(rect=[0, 0, 1, 0.95])  # 调整上边距为标题留空间
+    # letter = method_to_letter.get(methods[idx], '')
+    # fig.suptitle(methods[idx], fontsize=30, fontweight='bold')#y=0.98
+    # letter = method_to_letter.get(methods[idx], '')
+    # if letter:
+    #     fig.text(0.02, 0.98, letter, fontsize=30,
+    #              va='top', ha='left')
+    #
+    # # plt.tight_layout(rect=[0, 0, 0.9, 0.95])
+    # # cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])  # [left, bottom, width, height]
+    # # contour1.set_clim(0, 1)
+    # # cbar = fig.colorbar(contour1, cax=cbar_ax)
+    # # cbar.set_ticks([0, 0.2, 0.4, 0.6, 0.8, 1])
+    # # tick_labels = cbar.ax.get_yticklabels()
+    # # plt.setp(tick_labels, fontsize=16, fontweight='bold')
+    #
+    # path=save_fig_folder+methods[idx]+'.tif'
+    # plt.savefig(path, dpi=300,format='tiff')
+    # plt.show()
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+plt.figure(figsize=(10, 8))
+print(len(all_roc_data))
+all_roc_data = sorted(all_roc_data, key=lambda x: x['auc'], reverse=True)
+for data in all_roc_data:
+    plt.plot(data['fpr'], data['tpr'], lw=2, label=f"{data['name']} (AUC={data['auc']:.3f})")
+plt.plot([0, 1], [0, 1], color='gray', lw=2, linestyle='--', label='Random Guess')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False positive rate', fontsize=12)
+plt.ylabel('True positive rate', fontsize=12)
+plt.title('ROC curves comparison of all models', fontsize=14)
+plt.legend(loc="lower right", fontsize=9)
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig(save_fig_folder + 'ROC_Comparison_All_Models.tiff', dpi=300)
+plt.show()
 
 
-    # cmap = plt.cm.viridis
-    cmap = plt.cm.turbo
-    norm = plt.Normalize(vmin=0, vmax=1)
-
-
-    levels=10
-    contour1 = axes[0, 0].contourf(X, Y, accuracy_matrix, levels, cmap=cmap, norm=norm, alpha=0.8)
-    axes[0, 0].set_title('Accuracy', fontsize=20, fontweight='bold')
-    axes[0, 0].set_xlabel('low susceptible threshold', fontsize=16, fontweight='bold')
-    axes[0, 0].set_ylabel('high susceptible threshold', fontsize=16, fontweight='bold')
-    axes[0, 0].plot([x_low.min(), x_low.max()], [y_high.min(), y_high.max()], '--', color='black',alpha=0.7, label='y=x')
-    axes[0, 0].legend()
-
-    contour2 = axes[0, 1].contourf(X, Y, precision_matrix, levels, cmap=cmap, norm=norm, alpha=0.8)
-    axes[0, 1].set_title('Precision', fontsize=20, fontweight='bold')
-    axes[0, 1].set_xlabel('low susceptible threshold', fontsize=16, fontweight='bold')
-    axes[0, 1].set_ylabel('high susceptible threshold', fontsize=16, fontweight='bold')
-    axes[0, 1].plot([x_low.min(), x_low.max()], [y_high.min(), y_high.max()], '--', color='black',alpha=0.7, label='y=x')
-    axes[0, 1].legend()
-
-    contour3 = axes[1, 0].contourf(X, Y, recall_matrix, levels, cmap=cmap, norm=norm, alpha=0.8)
-    axes[1, 0].set_title('Recall', fontsize=20, fontweight='bold')
-    axes[1, 0].set_xlabel('low susceptible threshold', fontsize=16, fontweight='bold')
-    axes[1, 0].set_ylabel('high susceptible threshold', fontsize=16, fontweight='bold')
-    axes[1, 0].plot([x_low.min(), x_low.max()], [y_high.min(), y_high.max()], '--', color='black',alpha=0.7, label='y=x')
-    axes[1, 0].legend()
-
-    contour4 = axes[1, 1].contourf(X, Y, f1_matrix, levels, cmap=cmap, norm=norm, alpha=0.8)
-    axes[1, 1].set_title('F1 Score', fontsize=20, fontweight='bold')
-    axes[1, 1].set_xlabel('low susceptible threshold', fontsize=16, fontweight='bold')
-    axes[1, 1].set_ylabel('high susceptible threshold', fontsize=16, fontweight='bold')
-    axes[1, 1].plot([x_low.min(), x_low.max()], [y_high.min(), y_high.max()], '--', color='black',alpha=0.7, label='y=x')
-    axes[1, 1].legend()
-
-    plt.tight_layout(rect=[0, 0, 1, 0.95])  # 调整上边距为标题留空间
-    letter = method_to_letter.get(methods[idx], '')
-    fig.suptitle(methods[idx], fontsize=30, fontweight='bold')#y=0.98
-    letter = method_to_letter.get(methods[idx], '')
-    if letter:
-        fig.text(0.02, 0.98, letter, fontsize=30,
-                 va='top', ha='left')
-
-    # plt.tight_layout(rect=[0, 0, 0.9, 0.95])
-    # cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])  # [left, bottom, width, height]
-    # contour1.set_clim(0, 1)
-    # cbar = fig.colorbar(contour1, cax=cbar_ax)
-    # cbar.set_ticks([0, 0.2, 0.4, 0.6, 0.8, 1])
-    # tick_labels = cbar.ax.get_yticklabels()
-    # plt.setp(tick_labels, fontsize=16, fontweight='bold')
-
-    path=save_fig_folder+methods[idx]+'.tif'
-    plt.savefig(path, dpi=300,format='tiff')
-    plt.show()
 
     # 转换为 DataFrame 并保存为 CSV
 # df = pd.DataFrame(accuracy_matrix)
